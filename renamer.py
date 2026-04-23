@@ -307,6 +307,7 @@ def _collect_pairs(
     pairs: list[tuple[Path, Path | None, dict]] = []
     seen_media: set[Path] = set()
     title_to_data: dict[str, dict] = {}
+    unmatched_sidecars: dict[str, str] = {}  # title_lower -> sidecar filename
 
     for name_lower in sorted(name_index):
         if not name_lower.endswith(".json"):
@@ -338,7 +339,8 @@ def _collect_pairs(
         # Locate the media file via O(1) case-insensitive lookup
         media_file = name_index.get(media_name.lower())
         if media_file is None or not media_file.is_file():
-            log("WARN", f"Media file not found for sidecar: {json_file.name} (title: {media_name!r})")
+            # Don't warn yet — the media file may be matched later via fuzzy lookup
+            unmatched_sidecars[media_name.lower()] = json_file.name
             continue
 
         if media_file.suffix.lower() not in MEDIA_EXTENSIONS:
@@ -365,13 +367,27 @@ def _collect_pairs(
     # Secondary pass: fuzzy-match remaining orphans via edit suffixes, counter
     # variants, or filename-prefix truncation.
     remaining_orphans: list[Path] = []
+    fuzzy_matched_names: set[str] = set()
     for orphan in orphans:
         borrowed = _fuzzy_sidecar_lookup(orphan, title_to_data)
         if borrowed is not None:
             log("INFO", f"Fuzzy-matched sidecar data for orphan: {orphan.name}")
             pairs.append((orphan, None, borrowed))
+            fuzzy_matched_names.add(orphan.name.lower())
         else:
             remaining_orphans.append(orphan)
+
+    # Now warn only about sidecars whose title had no media file AND whose
+    # title stem wasn't resolved by the fuzzy pass either.
+    for title_lower, sidecar_name in unmatched_sidecars.items():
+        dot = title_lower.rfind(".")
+        title_stem = title_lower[:dot] if dot != -1 else title_lower
+        resolved = any(
+            n == title_lower or n.startswith(title_stem)
+            for n in fuzzy_matched_names
+        )
+        if not resolved:
+            log("WARN", f"No media file found for sidecar: {sidecar_name} (title: {title_lower!r})")
 
     return pairs, existing_names, remaining_orphans
 
