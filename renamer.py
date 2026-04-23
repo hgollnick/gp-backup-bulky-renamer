@@ -68,6 +68,13 @@ MEDIA_EXTENSIONS: frozenset[str] = frozenset({
 # Used to skip sidecar JSONs that were already processed in a previous run.
 _ALREADY_RENAMED_RE = re.compile(r"^\d{8}_\d{6}_", re.IGNORECASE)
 
+# Suffixes that Google Photos appends to edited/processed media variants.
+# These files share the original's sidecar (which references the base name).
+_EDIT_SUFFIXES: tuple[str, ...] = ("-editada", "-edited", "-edit")
+
+# Extracts YYYYMMDD_HHMMSS from anywhere in a filename stem.
+_FILENAME_DATE_RE = re.compile(r"(\d{8})_(\d{6})")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,6 +119,63 @@ def _resolve_unique_names(
         if nm.lower() not in existing and nj.lower() not in existing:
             return nm, nj
         counter += 1
+
+
+def _fuzzy_sidecar_lookup(
+    orphan: Path, title_to_data: dict[str, dict]
+) -> dict | None:
+    """
+    Secondary sidecar matching for files that have no exact-title match.
+
+    Tries three strategies in order:
+      1. Edit-suffix stripping  — 'X-editada.jpg' -> look for title 'X.jpg'
+      2. Counter suffix          — 'X(1).jpg'      -> look for title 'X.jpg'
+      3. Prefix match            — 'X_S.jpg'        -> look for title starting
+                                   with 'X_S' (handles Takeout filename truncation)
+    """
+    stem = orphan.stem
+    ext = orphan.suffix
+
+    # 1. Edit suffix stripping
+    for sfx in _EDIT_SUFFIXES:
+        if stem.lower().endswith(sfx):
+            base_title = (stem[: -len(sfx)] + ext).lower()
+            if base_title in title_to_data:
+                return title_to_data[base_title]
+
+    # 2. Counter suffix stripping: 'name(1).jpg' -> 'name.jpg'
+    base_stem = re.sub(r"\(\d+\)$", "", stem)
+    if base_stem != stem:
+        base_title = (base_stem + ext).lower()
+        if base_title in title_to_data:
+            return title_to_data[base_title]
+
+    # 3. Prefix match: orphan stem (or its counter-stripped base) is a truncated
+    #    prefix of a full sidecar title (handles Takeout filename truncation).
+    for candidate in dict.fromkeys([stem.lower(), base_stem.lower()]):
+        if len(candidate) >= 10:  # avoid accidental short-name false positives
+            for title_lower, data in title_to_data.items():
+                dot = title_lower.rfind(".")
+                title_stem = title_lower[:dot] if dot != -1 else title_lower
+                if title_stem.startswith(candidate) and len(title_stem) > len(candidate):
+                    return data
+
+    # 4. Reverse prefix: orphan stem extends a known base title stem.
+    #    Handles Takeout-truncated edit suffixes, e.g. 'NAME-editad.JPG' whose
+    #    sidecar references the base 'NAME.JPG'.
+    orphan_stem_lower = stem.lower()
+    if len(orphan_stem_lower) >= 10:
+        for title_lower, data in title_to_data.items():
+            dot = title_lower.rfind(".")
+            title_stem = title_lower[:dot] if dot != -1 else title_lower
+            if (
+                len(title_stem) >= 10
+                and orphan_stem_lower.startswith(title_stem)
+                and len(orphan_stem_lower) > len(title_stem)
+            ):
+                return data
+
+    return None
 
 
 def _check_exiftool() -> bool:
@@ -240,8 +304,9 @@ def _collect_pairs(
 
     existing_names: set[str] = set(name_index.keys())
 
-    pairs: list[tuple[Path, Path, dict]] = []
+    pairs: list[tuple[Path, Path | None, dict]] = []
     seen_media: set[Path] = set()
+    title_to_data: dict[str, dict] = {}
 
     for name_lower in sorted(name_index):
         if not name_lower.endswith(".json"):
@@ -266,6 +331,9 @@ def _collect_pairs(
         if not media_name:
             log("WARN", f"No 'title' in sidecar: {json_file.name}")
             continue
+
+        # Record every valid sidecar title for secondary (fuzzy) matching later
+        title_to_data[media_name.lower()] = data
 
         # Locate the media file via O(1) case-insensitive lookup
         media_file = name_index.get(media_name.lower())
@@ -294,7 +362,18 @@ def _collect_pairs(
         )
     ]
 
-    return pairs, existing_names, orphans
+    # Secondary pass: fuzzy-match remaining orphans via edit suffixes, counter
+    # variants, or filename-prefix truncation.
+    remaining_orphans: list[Path] = []
+    for orphan in orphans:
+        borrowed = _fuzzy_sidecar_lookup(orphan, title_to_data)
+        if borrowed is not None:
+            log("INFO", f"Fuzzy-matched sidecar data for orphan: {orphan.name}")
+            pairs.append((orphan, None, borrowed))
+        else:
+            remaining_orphans.append(orphan)
+
+    return pairs, existing_names, remaining_orphans
 
 
 def process(folder: Path, *, dry_run: bool, embed: bool) -> None:
@@ -340,7 +419,7 @@ def process(folder: Path, *, dry_run: bool, embed: bool) -> None:
 
         log("INFO", f"{media_file.name}")
         log("INFO", f"  -> {new_media_name}")
-        if json_file.name != new_json_name:
+        if json_file is not None and json_file.name != new_json_name:
             log("INFO", f"{json_file.name}")
             log("INFO", f"  -> {new_json_name}")
 
@@ -356,7 +435,7 @@ def process(folder: Path, *, dry_run: bool, embed: bool) -> None:
         except OSError as exc:
             log("WARN", f"Could not update mtime for {media_file.name}: {exc}")
 
-        # ── 2. Rename media then sidecar ──────────────────────────────────────
+        # ── 2. Rename media (and sidecar when one exists) ─────────────────────
         try:
             media_file.rename(new_media_path)
         except OSError as exc:
@@ -364,20 +443,22 @@ def process(folder: Path, *, dry_run: bool, embed: bool) -> None:
             counts["errors"] += 1
             continue
 
-        try:
-            json_file.rename(new_json_path)
-        except OSError as exc:
-            log("ERROR", f"Could not rename sidecar: {exc}")
+        if json_file is not None:
             try:
-                new_media_path.rename(media_file)
-            except OSError:
-                pass
-            counts["errors"] += 1
-            continue
+                json_file.rename(new_json_path)
+            except OSError as exc:
+                log("ERROR", f"Could not rename sidecar: {exc}")
+                try:
+                    new_media_path.rename(media_file)
+                except OSError:
+                    pass
+                counts["errors"] += 1
+                continue
 
         # Keep the in-memory set consistent so future conflict checks are correct
         existing_names.discard(media_file.name.lower())
-        existing_names.discard(json_file.name.lower())
+        if json_file is not None:
+            existing_names.discard(json_file.name.lower())
         existing_names.add(new_media_name.lower())
         existing_names.add(new_json_name.lower())
 
@@ -387,28 +468,79 @@ def process(folder: Path, *, dry_run: bool, embed: bool) -> None:
         if embed:
             embed_queue.append((new_media_path, data, dt))
 
-    # ── 3. Move orphans (no sidecar) to Orphan/ subfolder ────────────────────
+    # ── 3. Process remaining orphans (no sidecar) ────────────────────────────
     if orphans:
-        orphan_dir = folder / "Orphan"
         print()
-        log("INFO", f"Moving {len(orphans)} orphan file(s) to Orphan/...")
+        log("INFO", f"Processing {len(orphans)} orphan file(s) (no sidecar)...")
+        orphan_dir = folder / "Orphan"
         for media_file in sorted(orphans, key=lambda p: p.name):
-            log("SKIP", f"No sidecar — {'would move' if dry_run else 'moving'} {media_file.name} -> Orphan/")
-            if dry_run:
-                counts["orphaned"] += 1
-                continue
-            try:
-                orphan_dir.mkdir(exist_ok=True)
-                dest = orphan_dir / media_file.name
-                counter = 1
-                while dest.exists():
-                    dest = orphan_dir / f"{media_file.stem}_{counter:02d}{media_file.suffix}"
-                    counter += 1
-                media_file.rename(dest)
-                counts["orphaned"] += 1
-            except OSError as exc:
-                log("ERROR", f"Could not move orphan {media_file.name}: {exc}")
-                counts["errors"] += 1
+            # Try to extract a usable timestamp from the filename itself.
+            m = _FILENAME_DATE_RE.search(media_file.stem)
+            if m:
+                prefix = f"{m.group(1)}_{m.group(2)}"
+                new_media_name = f"{prefix}_{media_file.name}"
+                # Avoid the degenerate 'YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS.ext' when
+                # the stem IS already exactly the timestamp.
+                if media_file.stem == f"{m.group(1)}_{m.group(2)}":
+                    log("OK", f"Already date-named — {media_file.name}")
+                    counts["skipped"] += 1
+                    continue
+                new_media_name, _ = _resolve_unique_names(
+                    existing_names, new_media_name, new_media_name + ".json"
+                )
+                new_media_path = folder / new_media_name
+                log("INFO", f"{media_file.name} (no sidecar, date from filename)")
+                log("INFO", f"  -> {new_media_name}")
+                if dry_run:
+                    counts["renamed"] += 1
+                    continue
+                try:
+                    media_file.rename(new_media_path)
+                    existing_names.discard(media_file.name.lower())
+                    existing_names.add(new_media_name.lower())
+                    log("OK", f"Renamed {media_file.name}")
+                    counts["renamed"] += 1
+                except OSError as exc:
+                    log("ERROR", f"Could not rename {media_file.name}: {exc}")
+                    counts["errors"] += 1
+            else:
+                # Last resort: use the file's own mtime as the date prefix.
+                try:
+                    mtime = media_file.stat().st_mtime
+                    dt_mtime = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                    prefix = dt_mtime.strftime("%Y%m%d_%H%M%S")
+                    new_media_name = f"{prefix}_{media_file.name}"
+                    new_media_name, _ = _resolve_unique_names(
+                        existing_names, new_media_name, new_media_name + ".json"
+                    )
+                    new_media_path = folder / new_media_name
+                    log("INFO", f"{media_file.name} (no sidecar, date from file mtime)")
+                    log("INFO", f"  -> {new_media_name}")
+                    if dry_run:
+                        counts["renamed"] += 1
+                    else:
+                        media_file.rename(new_media_path)
+                        existing_names.discard(media_file.name.lower())
+                        existing_names.add(new_media_name.lower())
+                        log("OK", f"Renamed {media_file.name}")
+                        counts["renamed"] += 1
+                except OSError as exc:
+                    log("SKIP", f"No sidecar, no date — {'would move' if dry_run else 'moving'} {media_file.name} -> Orphan/")
+                    if dry_run:
+                        counts["orphaned"] += 1
+                        continue
+                    try:
+                        orphan_dir.mkdir(exist_ok=True)
+                        dest = orphan_dir / media_file.name
+                        counter = 1
+                        while dest.exists():
+                            dest = orphan_dir / f"{media_file.stem}_{counter:02d}{media_file.suffix}"
+                            counter += 1
+                        media_file.rename(dest)
+                        counts["orphaned"] += 1
+                    except OSError as exc2:
+                        log("ERROR", f"Could not move orphan {media_file.name}: {exc2}")
+                        counts["errors"] += 1
 
     # ── 4. Embed metadata — ONE exiftool process for all files ────────────────
     if embed_queue:
